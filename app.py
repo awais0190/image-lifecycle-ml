@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 import clip_service
 import similarity as sim
+from services import face_service
 
 # ---------------------------------------------------------------------------
 # Logging — timestamp + level + message on every line
@@ -60,9 +61,11 @@ EMBEDDING_DIM = 512
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load CLIP model before the server starts accepting requests."""
+    """Load CLIP and DeepFace models before the server starts accepting requests."""
     logger.info("Starting up — loading CLIP model …")
     clip_service.load_model()
+    logger.info("Starting up — loading DeepFace ArcFace model …")
+    await _run_in_thread(face_service.load_model)
     yield
     logger.info("Shutting down image-lifecycle-ml service.")
 
@@ -182,13 +185,17 @@ async def _run_in_thread(fn, *args):
 @app.get("/health", summary="Liveness check")
 async def health():
     """
-    Returns service status and whether the CLIP model is loaded.
+    Returns service status and whether the CLIP and face models are loaded.
 
     Response
     --------
-    { "status": "ok", "model_loaded": true }
+    { "status": "ok", "clip_loaded": true, "face_loaded": true }
     """
-    return {"status": "ok", "model_loaded": clip_service.is_model_loaded()}
+    return {
+        "status":       "ok",
+        "clip_loaded":  clip_service.is_model_loaded(),
+        "face_loaded":  face_service.is_ready(),
+    }
 
 
 @app.post("/embed", summary="Generate a CLIP embedding")
@@ -404,6 +411,92 @@ async def analyze(
         "all_scores": all_scores,
         "status": "success",
     }
+
+
+@app.post("/face/detect", summary="Detect faces in a single image")
+async def face_detect(
+    image: UploadFile = File(...),
+):
+    """
+    Detect whether a face is present in one image.
+
+    Accepts **multipart/form-data** with field:
+    - ``image`` — the image to analyse
+
+    Returns
+    -------
+    ```json
+    { "face_detected": true, "face_count": 1, "confidence": 0.99 }
+    ```
+    Always returns 200 — ``face_detected`` is ``false`` when no face is found.
+    """
+    if not face_service.is_ready():
+        raise HTTPException(status_code=503, detail="Face model is not loaded yet.")
+
+    _validate_image_content_type(image)
+    raw = await image.read()
+    _validate_file_size(raw)
+
+    result = await _run_in_thread(face_service.detect, raw)
+    return result
+
+
+@app.post("/face/verify", summary="Verify whether two images show the same person")
+async def face_verify(
+    img1: UploadFile = File(...),
+    img2: UploadFile = File(...),
+):
+    """
+    Verify whether the faces in two uploaded images belong to the same person.
+
+    Uses DeepFace ArcFace with cosine distance.  The model is loaded once at
+    startup and reused for every request.
+
+    Accepts **multipart/form-data** with fields:
+    - ``img1`` — first image (JPEG / PNG / WebP / GIF / BMP / TIFF)
+    - ``img2`` — second image
+
+    Returns
+    -------
+    ```json
+    {
+        "verified":      true,
+        "distance":      0.42,
+        "model":         "ArcFace",
+        "face_detected": true
+    }
+    ```
+
+    ``face_detected`` is ``false`` when no face was found by the OpenCV
+    detector and the service fell back to treating the whole image as the
+    face region.
+
+    Errors
+    ------
+    - **503** — model not loaded yet (startup still in progress)
+    - **422** — no face could be detected in one or both images
+    - **413** — one of the uploaded files exceeds the 10 MB limit
+    """
+    if not face_service.is_ready():
+        raise HTTPException(status_code=503, detail="Face model is not loaded yet.")
+
+    _validate_image_content_type(img1)
+    _validate_image_content_type(img2)
+
+    raw1 = await img1.read()
+    raw2 = await img2.read()
+    _validate_file_size(raw1)
+    _validate_file_size(raw2)
+
+    try:
+        result = await _run_in_thread(face_service.verify, raw1, raw2)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.error("Face verification error: %s", exc)
+        raise HTTPException(status_code=500, detail="Face verification failed.")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
