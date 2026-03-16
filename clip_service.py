@@ -131,6 +131,96 @@ def get_embedding_from_file(file_bytes: bytes) -> Optional[np.ndarray]:
         return None
 
 
+def classify_editing(file_bytes: bytes) -> dict:
+    """
+    Zero-shot CLIP classification for editing / manipulation detection.
+
+    Compares the image against two sets of text prompts:
+      • Edited indicators  — text overlays, watermarks, social posts, screenshots, etc.
+      • Original indicators — raw photographs, unedited camera images
+
+    Uses softmax over all prompts so scores are calibrated probabilities.
+
+    Returns
+    -------
+    {
+        "edit_probability": float,    # 0–1; higher = more likely edited/processed
+        "top_indicators":  list[str], # up to 3 editing prompts that matched strongly
+        "is_edited":       bool,      # edit_probability >= 0.55
+    }
+    """
+    if not _model_loaded:
+        return {"edit_probability": 0.0, "top_indicators": [], "is_edited": False}
+
+    import torch
+
+    EDITED_PROMPTS = [
+        "a photo with text written on it",
+        "a social media post with a caption",
+        "a watermarked image",
+        "a screenshot of a phone or computer",
+        "a thumbnail with text overlay",
+        "a photoshopped or digitally manipulated image",
+        "an edited photo with filters or effects",
+        "a meme with text",
+        "an image with a logo or brand overlay",
+        "a promotional or marketing graphic",
+        "a composite image made from multiple photos",
+        "a photo with stickers or emoji",
+        "an image with a title or headline text",
+        "a digitally enhanced photograph",
+        "an image with a black or white border added",
+    ]
+
+    ORIGINAL_PROMPTS = [
+        "an original unedited photograph",
+        "a natural raw photo from a camera",
+        "an authentic unmanipulated image",
+    ]
+
+    all_prompts = EDITED_PROMPTS + ORIGINAL_PROMPTS
+
+    try:
+        image  = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        tensor = _preprocess(image).unsqueeze(0)
+
+        tokens = clip.tokenize(all_prompts)
+
+        with torch.no_grad():
+            img_features  = _model.encode_image(tensor)
+            text_features = _model.encode_text(tokens)
+
+            img_features  = img_features  / img_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            # Cosine similarities scaled by CLIP's learned temperature (100×)
+            logits = (100.0 * img_features @ text_features.T).squeeze(0)
+            probs  = logits.softmax(dim=-1).cpu().numpy()
+
+        n_edited   = len(EDITED_PROMPTS)
+        edited_prob = float(probs[:n_edited].sum())
+
+        # Top editing indicators (prompts with highest individual probability)
+        edited_probs = list(zip(EDITED_PROMPTS, probs[:n_edited].tolist()))
+        edited_probs.sort(key=lambda x: x[1], reverse=True)
+        top_indicators = [p for p, _ in edited_probs[:3] if _ > 0.01]
+
+        logger.debug(
+            "classify_editing: edit_prob=%.3f  top=%s",
+            edited_prob, top_indicators[:1],
+        )
+
+        return {
+            "edit_probability": round(edited_prob, 4),
+            "top_indicators":   top_indicators,
+            "is_edited":        edited_prob >= 0.55,
+        }
+
+    except Exception as exc:
+        logger.error("classify_editing failed: %s", exc)
+        return {"edit_probability": 0.0, "top_indicators": [], "is_edited": False}
+
+
 def get_embedding_from_url(url: str) -> Optional[np.ndarray]:
     """
     Download an image from *url* and return its 512-dim CLIP embedding.

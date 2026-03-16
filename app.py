@@ -27,6 +27,7 @@ from pydantic import BaseModel
 import clip_service
 import similarity as sim
 from services import face_service, partial_match_service
+from analyzers.edit_analyzer import edit_analyzer
 
 # ---------------------------------------------------------------------------
 # Logging — timestamp + level + message on every line
@@ -499,6 +500,42 @@ async def face_verify(
     return result
 
 
+@app.post("/classify/editing", summary="Zero-shot CLIP editing/manipulation classification")
+async def classify_editing(
+    file: UploadFile = File(...),
+):
+    """
+    Classify whether an image has been edited or digitally manipulated using
+    CLIP zero-shot classification.
+
+    Compares the image against prompts describing edited images (text overlays,
+    watermarks, social-media posts, screenshots, composites …) and original
+    photographs, returning a calibrated editing probability.
+
+    Accepts **multipart/form-data** with field:
+    - ``file`` — the image to classify
+
+    Returns
+    -------
+    ```json
+    {
+        "edit_probability": 0.78,
+        "top_indicators":   ["a photo with text written on it", "a watermarked image"],
+        "is_edited":        true
+    }
+    ```
+    """
+    if not clip_service.is_model_loaded():
+        raise HTTPException(status_code=503, detail="CLIP model is not loaded yet.")
+
+    _validate_image_content_type(file)
+    raw = await file.read()
+    _validate_file_size(raw)
+
+    result = await _run_in_thread(clip_service.classify_editing, raw)
+    return result
+
+
 @app.post("/image/partial-match", summary="Detect if one image is a crop/region of the other")
 async def image_partial_match(
     img1: UploadFile = File(...),
@@ -535,6 +572,101 @@ async def image_partial_match(
     _validate_file_size(raw2)
 
     result = await _run_in_thread(partial_match_service.detect_partial_match, raw1, raw2)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Edit detection endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/edit/health", summary="Which edit detectors are ready")
+async def edit_health():
+    """
+    Reports readiness of each edit detector.
+
+    ColorChangeDetector and ObjectDetector use only OpenCV/NumPy and are
+    always ready immediately (no model loading required).
+
+    Returns
+    -------
+    { "color_detector": true, "object_detector": true, "all_ready": true }
+    """
+    return {
+        "color_detector":  True,
+        "object_detector": True,
+        "all_ready":       True,
+    }
+
+
+@app.post("/edit/analyze-single", summary="Colour-change analysis for one image")
+async def edit_analyze_single(
+    image: UploadFile = File(...),
+):
+    """
+    Analyse a single image for signs of colour manipulation (filter, hue shift,
+    desaturation, brightness boost).
+
+    Returns a **FullEditReport** — overall severity + per-detector results.
+    No heavy model required; typical latency < 500 ms.
+    """
+    _validate_image_content_type(image)
+    raw = await image.read()
+    _validate_file_size(raw)
+
+    result = await _run_in_thread(edit_analyzer.analyze_single_bytes, raw)
+    return result
+
+
+@app.post("/edit/analyze-comparison", summary="Full edit analysis comparing two images")
+async def edit_analyze_comparison(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...),
+):
+    """
+    Compare two images and detect specific edit types:
+    - **Colour change** — filter, hue shift, saturation/brightness change
+    - **Object change** — regions added, removed, or modified; diff heatmap
+
+    Returns a **FullEditReport** with a base64-encoded diff heatmap PNG.
+    Typical latency 1–3 s depending on image size.
+
+    ``image1`` is treated as the reference (original).
+    ``image2`` is the version being examined.
+    """
+    _validate_image_content_type(image1)
+    _validate_image_content_type(image2)
+    raw1 = await image1.read()
+    raw2 = await image2.read()
+    _validate_file_size(raw1)
+    _validate_file_size(raw2)
+
+    result = await _run_in_thread(
+        edit_analyzer.analyze_comparison_bytes, raw1, raw2
+    )
+    return result
+
+
+@app.post("/edit/quick-check", summary="Fast colour-only edit check (< 1 s)")
+async def edit_quick_check(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...),
+):
+    """
+    Fast two-image colour comparison — skips object diff and heatmap generation.
+    Designed for real-time use where latency matters.
+
+    Returns
+    -------
+    { "is_edited": bool, "edit_types": ["color_change"], "confidence": float }
+    """
+    _validate_image_content_type(image1)
+    _validate_image_content_type(image2)
+    raw1 = await image1.read()
+    raw2 = await image2.read()
+    _validate_file_size(raw1)
+    _validate_file_size(raw2)
+
+    result = await _run_in_thread(edit_analyzer.quick_check_bytes, raw1, raw2)
     return result
 
 
