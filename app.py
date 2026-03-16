@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 import clip_service
 import similarity as sim
-from services import face_service
+from services import face_service, partial_match_service
 
 # ---------------------------------------------------------------------------
 # Logging — timestamp + level + message on every line
@@ -496,6 +496,45 @@ async def face_verify(
         logger.error("Face verification error: %s", exc)
         raise HTTPException(status_code=500, detail="Face verification failed.")
 
+    return result
+
+
+@app.post("/image/partial-match", summary="Detect if one image is a crop/region of the other")
+async def image_partial_match(
+    img1: UploadFile = File(...),
+    img2: UploadFile = File(...),
+):
+    """
+    Detect whether one image is a cropped or partial sub-region of the other.
+
+    Uses multi-scale OpenCV template matching (TM_CCOEFF_NORMED) to find if
+    one image physically appears within the other — even after resizing.
+
+    Accepts **multipart/form-data** with fields:
+    - ``img1`` — first image
+    - ``img2`` — second image
+
+    Returns
+    -------
+    ```json
+    {
+        "is_partial":  true,
+        "confidence":  0.73,
+        "which":       "B_in_A"
+    }
+    ```
+    ``which`` is ``"B_in_A"`` (img2 is inside img1) or ``"A_in_B"`` (img1 is inside img2).
+    ``which`` is ``null`` when ``is_partial`` is ``false``.
+    """
+    _validate_image_content_type(img1)
+    _validate_image_content_type(img2)
+
+    raw1 = await img1.read()
+    raw2 = await img2.read()
+    _validate_file_size(raw1)
+    _validate_file_size(raw2)
+
+    result = await _run_in_thread(partial_match_service.detect_partial_match, raw1, raw2)
     return result
 
 
